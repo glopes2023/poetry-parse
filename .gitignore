@@ -1,0 +1,17 @@
+# Virtual environment
+marker-env/
+
+# Generated output
+pipeline_output/
+
+# Source PDFs (large binaries)
+data/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+
+# macOS
+.DS_Store
