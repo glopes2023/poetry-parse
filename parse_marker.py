@@ -13,6 +13,64 @@ Key behaviour:
     into the preceding poem unless --no_merge_speakers is passed.
   - PageHeader / PageFooter / Footnote blocks are stripped from poem text.
 
+Per-anthology configuration:
+  Each anthology can have a sidecar JSON config file placed next to the PDF
+  with the same stem (e.g. anthology.pdf → anthology.json).  If found, it
+  overrides the default parsing behaviour for that file only.
+
+  Supported fields:
+
+    author_position (str, default "before_poems")
+      Controls where author attribution is expected relative to poem content.
+        "before_poems"  — one all-caps author header in the ToC covers a
+                          section of poems.  This is the default.
+        "after_poem"    — attribution appears as a block immediately after
+                          each poem's text (before the next poem title).
+                          The block is extracted from the poem text and
+                          stored as the author.
+
+    author_attribution_pattern (str | null, default null)
+      Optional regex applied to candidate author blocks when
+      author_position == "after_poem".  If provided it takes precedence
+      over the standard all-caps poet heuristic, allowing anthologies
+      that use title-case or punctuated attributions (e.g. "— Ben Jonson")
+      to be handled correctly.  The full stripped block text is matched
+      with re.match(); capture group 1, if present, is used as the name
+      (otherwise the whole match is used).
+
+    poet_uppercase_threshold (float, default 0.65)
+      Minimum fraction of alphabetic characters that must be uppercase for
+      a short ToC entry to be classified as a poet header rather than a
+      poem title.  Lower this value for anthologies whose author names
+      are printed in mixed case.
+
+    author_in_page_headers (bool, default false)
+      When true, PageHeader blocks (the running headers printed at the top
+      of alternating pages) are scanned for poet names and used as a
+      last-resort author fallback.  Enable this for anthologies that print
+      each poet's name as a repeating page header throughout their section,
+      particularly when a multi-page biography separates the author heading
+      from their first poem.
+
+    skip_bio_pattern (str | null, default null)
+      Regex (case-insensitive) matched against ToC entry titles.  Poem-type
+      entries whose title matches are dropped before extraction, preventing
+      biography or introduction sections that appear in the ToC from
+      becoming spurious poem records.
+      Example: "^(Life of|Biography|Introduction to|Memoir of)"
+
+  Example sidecar file (anthology.json):
+    {
+      "author_position": "after_poem",
+      "author_attribution_pattern": "^[-–—]\\s*(.+)$"
+    }
+
+  Example for bio-section anthologies:
+    {
+      "author_in_page_headers": true,
+      "skip_bio_pattern": "^(Life of|Memoir of|Introduction to)"
+    }
+
 Usage:
     python parse_marker.py --input data/anthology.pdf
     python parse_marker.py --input data/anthology.pdf --output_format json_combined
@@ -141,8 +199,65 @@ class Poem:
     source_page: int = 0
     text: str = ""
     notes: str = ""
-    needs_review: bool = False
-    review_reason: str = ""
+
+
+@dataclass
+class AnthologyConfig:
+    """
+    Per-anthology parsing configuration loaded from a sidecar JSON file.
+
+    See the module docstring for full field documentation and an example file.
+    Instantiate directly for programmatic use, or call load_anthology_config()
+    to auto-discover the sidecar file for a given PDF path.
+    """
+    author_position: str = "before_poems"
+    """
+    Where author attribution appears relative to poem content.
+    "before_poems" (default) — all-caps author header precedes a section.
+    "after_poem"              — attribution block follows each poem's text.
+    """
+
+    author_attribution_pattern: Optional[str] = None
+    """
+    Regex matched against candidate attribution blocks when
+    author_position == "after_poem".  Capture group 1 (if present) is
+    extracted as the author name; otherwise the full match is used.
+    When None the standard uppercase-ratio heuristic is used instead.
+    """
+
+    poet_uppercase_threshold: float = 0.65
+    """
+    Minimum fraction of uppercase alphabetic characters required for a
+    short ToC entry to be classified as a poet header.  Default 0.65.
+    """
+
+    author_in_page_headers: bool = False
+    """
+    When True, PageHeader blocks (the running headers printed at the top of
+    alternating pages) are scanned for author names.  Useful for anthologies
+    that print each poet's name as a repeating page header throughout their
+    section, especially when a multi-page biography separates the author
+    heading from the first poem.
+
+    Author names found this way are used as a last-resort fallback after the
+    ToC carry-forward and the SectionHeader block scan have both failed to
+    identify an author for a poem entry.  The highest-priority match on the
+    poem's page is used; if none, the preceding page is tried.
+    """
+
+    skip_bio_pattern: Optional[str] = None
+    """
+    Optional regex applied to every ToC entry title after classification.
+    Entries whose title matches (re.search) are dropped before poem
+    extraction, preventing multi-page biography sections from becoming
+    spurious poem records.
+
+    The pattern is matched case-insensitively.  Common values:
+        "^(Life of|Biography|Introduction to|Memoir of)"
+        "^(Note on|Notes on|Editor.s Note)"
+    Only "poem"-classified entries are filtered; "poet" and "collection"
+    entries are never dropped (they carry no text of their own).
+    """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,10 +270,11 @@ _GENRE_WORDS = {
     "EPIGRAM", "EPIGRAMS", "ELEGY", "ELEGIES", "EPISTLE", "EPISTLES",
     "SATIRE", "SATIRES", "BALLAD", "BALLADS", "PROLOGUE", "EPILOGUE",
     "CHORUS", "DIRGE", "EPITAPH", "EPITAPHS", "MADRIGAL", "SEXTAIN",
+    "TRAGEDY", "TRAGEDIES", "COMEDY", "COMEDIES", "DRAMA", "MASQUE", "MASQUES",
 }
 
 
-def classify_toc_entry(title: str) -> Optional[str]:
+def classify_toc_entry(title: str, threshold: float = 0.65) -> Optional[str]:
     """
     Return 'poet', 'collection', or 'poem' for a ToC title, or None to skip.
 
@@ -167,6 +283,15 @@ def classify_toc_entry(title: str) -> Optional[str]:
       2. Starts with '['          → 'collection'  (e.g. "[From The Forest.]")
       3. All-caps, ≤6 words, not a genre word  → 'poet'
       4. Anything else            → 'poem'
+
+    Parameters
+    ----------
+    title : str
+        Raw title string from the ToC or a SectionHeader block.
+    threshold : float
+        Minimum fraction of alphabetic characters that must be uppercase for
+        rule 3 to apply.  Defaults to 0.65; lower for mixed-case anthologies.
+        Comes from AnthologyConfig.poet_uppercase_threshold.
     """
     t = title.strip()
     if not t:
@@ -184,14 +309,16 @@ def classify_toc_entry(title: str) -> Optional[str]:
         alpha = [c for c in t if c.isalpha()]
         if alpha:
             upper_ratio = sum(1 for c in alpha if c.isupper()) / len(alpha)
-            if upper_ratio >= 0.65:
+            if upper_ratio >= threshold:
                 # Exclude genre/form words that happen to be all-caps
                 cleaned = re.sub(r"[^A-Za-z\s]", "", t).strip().upper()
-                if cleaned not in _GENRE_WORDS and cleaned.rstrip("S") not in _GENRE_WORDS:
+                cleaned_words = cleaned.split()
+                if not any(w in _GENRE_WORDS or w.rstrip("S") in _GENRE_WORDS for w in cleaned_words):
                     # Exclude common poem-starter words that can appear in short all-caps lines
                     poem_starters = {"AND", "THE", "BUT", "OR", "IF", "TO", "IN",
                                      "AS", "THAT", "WITH", "FOR", "NOT", "ALL",
-                                     "MY", "HER", "HIS", "ON", "WHERE", "WHEN"}
+                                     "MY", "HER", "HIS", "ON", "WHERE", "WHEN",
+                                     "FROM", "UPON", "AGAINST", "AFTER", "BEFORE"}
                     first_word = words[0].upper().strip(".,;:")
                     if first_word not in poem_starters:
                         return "poet"
@@ -233,7 +360,7 @@ def _block_html_text(block) -> str:
     Two passes (high → low confidence) catch both punctuated and unpunctuated
     line boundaries common in early modern poetry.
     """
-    html = re.sub(r"<br\s*/?>", "\n", block.html, flags=re.IGNORECASE)
+    html = re.sub(r"<br\s*/?>", "\n", block.html or "", flags=re.IGNORECASE)
     # Strip only horizontal whitespace — preserve trailing \n so that
     # "\n".join(poem_text_parts) produces \n\n (blank line) between blocks.
     text = re.sub(r"<[^>]+>", "", html).strip(" \t")
@@ -253,6 +380,7 @@ def map_toc_to_poems(
     rendered,
     anthology_name: str,
     merge_speakers: bool = True,
+    config: Optional[AnthologyConfig] = None,
 ) -> list[Poem]:
     """
     Map marker's JSONOutput to a list of Poems using the table_of_contents.
@@ -267,14 +395,22 @@ def map_toc_to_poems(
         If True, ToC entries that look like speaker labels within a dramatic
         poem (same page, within ~150px of the previous poem entry) are merged
         back into the preceding poem rather than becoming separate entries.
+    config : AnthologyConfig, optional
+        Per-anthology parsing settings (author position, thresholds, etc.).
+        If None a default AnthologyConfig() is used, which is equivalent to
+        the previous behaviour.
     """
+    if config is None:
+        config = AnthologyConfig()
     toc = rendered.metadata.get("table_of_contents", [])
     if not toc:
         print("[warn] table_of_contents is empty — no poems extracted.", file=sys.stderr)
         return []
 
-    # Build a flat ordered list of all content blocks indexed by page_id
-    # page_blocks: dict[int, list[block]]
+    # Build a flat ordered list of all content blocks indexed by page_id.
+    # PageHeader / PageFooter / Footnote are stripped here so they never
+    # appear in poem text.  When author_in_page_headers is set we do a
+    # separate pre-pass below (before stripping) to harvest author names.
     page_blocks: dict[int, list] = {}
     for page_block in rendered.children:
         pid = _page_id_from_block(page_block)
@@ -285,10 +421,23 @@ def map_toc_to_poems(
                     blocks.append(b)
         page_blocks[pid] = blocks
 
+    # Optional: build page_id → author map from running PageHeader blocks.
+    page_header_authors: dict[int, str] = {}
+    if config.author_in_page_headers:
+        page_header_authors = _build_page_header_author_map(
+            rendered, threshold=config.poet_uppercase_threshold
+        )
+        if page_header_authors:
+            print(
+                f"[author] Found page-header authors on "
+                f"{len(page_header_authors)} page(s).",
+                file=sys.stderr,
+            )
+
     # Classify and annotate ToC entries
     annotated = []
     for entry in toc:
-        kind = classify_toc_entry(entry["title"])
+        kind = classify_toc_entry(entry["title"], threshold=config.poet_uppercase_threshold)
         if kind is not None:
             annotated.append({
                 "title": entry["title"].strip(),
@@ -297,31 +446,68 @@ def map_toc_to_poems(
                 "kind": kind,
             })
 
-    # Walk entries, tracking context
+    # Walk entries, tracking context.
+    # "poem"-kind entries that match skip_bio_pattern are dropped before
+    # being added to poem_entries — this prevents biography sections that
+    # appear in the ToC from becoming spurious poem records.
+    bio_re = (
+        re.compile(config.skip_bio_pattern, re.IGNORECASE)
+        if config.skip_bio_pattern
+        else None
+    )
     current_poet = ""
     current_collection = ""
     poem_entries = []  # only 'poem'-kind entries with context attached
+    n_skipped_bio = 0
+
+    # Words that signal a continuation of the previous poet name (e.g. "OF HAWTHORNDEN")
+    _POET_CONTINUATIONS = {
+        "OF", "DE", "VAN", "DU", "DI", "VON", "LA", "LE",
+        "EARL", "LORD", "COUNT", "DUKE", "BARON", "VISCOUNT", "MARQUESS",
+    }
 
     for entry in annotated:
         if entry["kind"] == "poet":
-            current_poet = _clean_name(entry["title"])
-            current_collection = ""
+            first_word = entry["title"].strip().split()[0].upper().strip(".,;:")
+            if current_poet and first_word in _POET_CONTINUATIONS:
+                current_poet = current_poet + " " + _clean_name(entry["title"])
+            else:
+                current_poet = _clean_name(entry["title"])
+                current_collection = ""
         elif entry["kind"] == "collection":
             current_collection = entry["title"]
         else:
+            if bio_re and bio_re.search(entry["title"]):
+                n_skipped_bio += 1
+                continue
             poem_entries.append({
                 **entry,
                 "poet": current_poet,
                 "collection": current_collection,
             })
 
+    if n_skipped_bio:
+        print(
+            f"[toc] Skipped {n_skipped_bio} bio/intro section(s) "
+            f"matching skip_bio_pattern.",
+            file=sys.stderr,
+        )
+
     if not poem_entries:
         print("[warn] No poem entries found in ToC after classification.", file=sys.stderr)
         return []
 
-    # Fallback: infer missing authors from page-level SectionHeader blocks
-    if any(e["poet"] == "" for e in poem_entries):
-        poem_entries = _infer_author_from_blocks(poem_entries, page_blocks)
+    # Fallback: infer missing authors from page-level SectionHeader blocks,
+    # and (if author_in_page_headers) from the page-header author map.
+    # Only run for before_poems convention; after_poem handles attribution
+    # during block collection below.
+    if config.author_position == "before_poems" and any(e["poet"] == "" for e in poem_entries):
+        poem_entries = _infer_author_from_blocks(
+            poem_entries,
+            page_blocks,
+            threshold=config.poet_uppercase_threshold,
+            page_header_authors=page_header_authors,
+        )
 
     # Optionally merge speaker labels back into preceding poem
     if merge_speakers:
@@ -342,6 +528,7 @@ def map_toc_to_poems(
             next_top_y = float("inf")
 
         poem_text_parts = []
+        collected_blocks = []  # (block, rendered_text) — used for after_poem extraction
         first_page = None
 
         # Walk pages in order
@@ -376,15 +563,32 @@ def map_toc_to_poems(
                         if block.block_type == "SectionHeader":
                             m = re.match(r"<h([1-4])", block.html or "")
                             level = int(m.group(1)) if m else 2
-                            poem_text_parts.append(f"{'#' * level} {text.strip()}")
+                            rendered_text = f"{'#' * level} {text.strip()}"
                         else:
-                            poem_text_parts.append(text)
+                            rendered_text = text
+                        poem_text_parts.append(rendered_text)
+                        collected_blocks.append((block, rendered_text))
                     if first_page is None:
                         first_page = pid
 
+        # For after_poem anthologies: extract the trailing attribution block
+        # (if any) and use it as the author rather than leaving it in the text.
+        author = entry["poet"]
+        if config.author_position == "after_poem" and collected_blocks:
+            inferred, poem_text_parts = _extract_trailing_author(
+                collected_blocks, poem_text_parts, config
+            )
+            if inferred:
+                author = inferred
+                print(
+                    f"[author] Extracted trailing author '{author}' "
+                    f"for '{entry['title']}'",
+                    file=sys.stderr,
+                )
+
         poems.append(Poem(
             title=entry["title"],
-            author=entry["poet"],
+            author=author,
             collection=entry["collection"],
             source_anthology=anthology_name,
             source_page=first_page or poem_page,
@@ -394,9 +598,59 @@ def map_toc_to_poems(
     return poems
 
 
+def _build_page_header_author_map(rendered, threshold: float = 0.65) -> dict[int, str]:
+    """
+    Pre-pass over all pages to build a mapping of page_id → author_name from
+    PageHeader blocks.
+
+    PageHeader blocks are ordinarily stripped from poem text, but for anthologies
+    that print each poet's name as a running page header throughout their section
+    (author_in_page_headers=True) they are the most reliable author signal —
+    especially when a multi-page biography separates the author heading from the
+    first poem and the ToC carries no poet entry for that gap.
+
+    Only headers that pass the standard classify_toc_entry "poet" heuristic
+    (uppercase-ratio test) are recorded.  If multiple poet-like headers appear on
+    the same page the first one (lowest y) wins.
+
+    Parameters
+    ----------
+    rendered : JSONOutput
+        The raw PdfConverter output (has .children for pages).
+    threshold : float
+        Passed through to classify_toc_entry; comes from
+        AnthologyConfig.poet_uppercase_threshold.
+
+    Returns
+    -------
+    dict[int, str]
+        Maps page_id to cleaned author name for every page that has a
+        poet-classified PageHeader block.
+    """
+    result: dict[int, str] = {}
+    for page_block in rendered.children:
+        pid = _page_id_from_block(page_block)
+        if not page_block.children:
+            continue
+        candidates = []
+        for block in page_block.children:
+            if block.block_type != "PageHeader":
+                continue
+            text = _block_html_text(block).strip()
+            if classify_toc_entry(text, threshold=threshold) == "poet":
+                candidates.append((_block_top_y(block), text))
+        if candidates:
+            # Take the topmost header on the page
+            _, name = min(candidates, key=lambda x: x[0])
+            result[pid] = _clean_name(name)
+    return result
+
+
 def _infer_author_from_blocks(
     poem_entries: list[dict],
     page_blocks: dict[int, list],
+    threshold: float = 0.65,
+    page_header_authors: Optional[dict[int, str]] = None,
 ) -> list[dict]:
     """
     Fallback: for poems where the ToC yielded no author, scan the SectionHeader
@@ -404,11 +658,34 @@ def _infer_author_from_blocks(
     of the page passes the same 'poet' heuristic used for ToC entries, treat it
     as the author header and propagate it forward until a new author is found.
 
-    This handles the common anthology layout where:
+    If page_header_authors is provided (from _build_page_header_author_map), it
+    is consulted as a last resort after the SectionHeader scan fails.  This
+    covers the bio-section layout where the poet's name only appears in running
+    page headers and not as a SectionHeader block on the poem's own page.
+
+    This handles the common anthology layouts where:
       - an all-caps author name appears as a SectionHeader at the top of the
         first page of that author's section, and
-      - every subsequent poem by the same author inherits that name.
+      - every subsequent poem by the same author inherits that name; or
+      - a multi-page biography separates the author heading from the first poem,
+        but the author's name repeats in the page header throughout their section.
+
+    Parameters
+    ----------
+    poem_entries : list[dict]
+        Annotated poem entries from map_toc_to_poems.
+    page_blocks : dict[int, list]
+        All content blocks keyed by page ID.
+    threshold : float
+        Passed through to classify_toc_entry; comes from
+        AnthologyConfig.poet_uppercase_threshold.
+    page_header_authors : dict[int, str], optional
+        Map of page_id → author_name built from PageHeader blocks.  Only
+        provided when AnthologyConfig.author_in_page_headers is True.
     """
+    if page_header_authors is None:
+        page_header_authors = {}
+
     # Build a per-page list of SectionHeader blocks sorted top→bottom
     def _poet_headers_on_page(pid: int) -> list[str]:
         headers = []
@@ -416,7 +693,7 @@ def _infer_author_from_blocks(
             if block.block_type != "SectionHeader":
                 continue
             text = _block_html_text(block).strip()
-            if classify_toc_entry(text) == "poet":
+            if classify_toc_entry(text, threshold=threshold) == "poet":
                 headers.append((_block_top_y(block), text))
         # Return names only, sorted by y position (top first)
         return [name for _, name in sorted(headers)]
@@ -429,18 +706,31 @@ def _infer_author_from_blocks(
             result.append(entry)
             continue
 
-        # Try current page, then previous page
+        # Priority 1: SectionHeader blocks on current page, then previous page
         found = ""
+        source = ""
         for pid in (entry["page_id"], entry["page_id"] - 1):
             names = _poet_headers_on_page(pid)
             if names:
                 found = _clean_name(names[0])
+                source = "section header"
                 break
+
+        # Priority 2: running PageHeader blocks (author_in_page_headers path)
+        if not found:
+            for pid in (entry["page_id"], entry["page_id"] - 1):
+                if pid in page_header_authors:
+                    found = page_header_authors[pid]
+                    source = "page header"
+                    break
 
         if found:
             carry_poet = found
-            print(f"[author] Inferred '{carry_poet}' from page blocks for '{entry['title']}'",
-                  file=sys.stderr)
+            print(
+                f"[author] Inferred '{carry_poet}' from {source} "
+                f"for '{entry['title']}'",
+                file=sys.stderr,
+            )
 
         result.append({**entry, "poet": carry_poet})
 
@@ -465,11 +755,17 @@ def _merge_speaker_labels(poem_entries: list[dict]) -> list[dict]:
         same_page = entry["page_id"] == prev["page_id"]
         close_y = (entry["top_y"] - prev["top_y"]) < 200
 
-        # Heuristic: speaker label = short (≤4 words), no [, same page, close y
+        # Heuristic: speaker label = short (≤4 words), no [, same page, close y,
+        # and title contains no genre/form words (e.g. "Ode", "Song", "Hymn")
         words = entry["title"].split()
+        title_words = {re.sub(r"[^A-Za-z]", "", w).upper() for w in words}
+        contains_genre_word = any(
+            w in _GENRE_WORDS or w.rstrip("S") in _GENRE_WORDS for w in title_words
+        )
         looks_like_speaker = (
             len(words) <= 4
             and not entry["title"].startswith("[")
+            and not contains_genre_word
             and same_page
             and close_y
         )
@@ -502,6 +798,92 @@ def _clean_name(raw: str) -> str:
     return name.title()
 
 
+def _extract_trailing_author(
+    collected_blocks: list[tuple],
+    poem_text_parts: list[str],
+    config: AnthologyConfig,
+) -> tuple[str, list[str]]:
+    """
+    For the "after_poem" convention: inspect the last collected block to see
+    if it is an author attribution rather than poem body.  If it matches,
+    return the cleaned author name and the text-parts list with that block
+    removed.  If it does not match, return ("", poem_text_parts) unchanged.
+
+    Matching strategy (in priority order):
+      1. If config.author_attribution_pattern is set, apply it with re.match.
+         Capture group 1, if present, is used as the name; otherwise the full
+         match text is used.
+      2. Otherwise fall back to the standard classify_toc_entry "poet"
+         heuristic (uppercase-ratio test) with the configured threshold.
+
+    Parameters
+    ----------
+    collected_blocks : list[tuple]
+        (block, rendered_text) pairs in document order for the current poem.
+    poem_text_parts : list[str]
+        Rendered text strings in the same order — the last entry corresponds
+        to the last block.
+    config : AnthologyConfig
+        The anthology's configuration; provides author_attribution_pattern
+        and poet_uppercase_threshold.
+    """
+    if not collected_blocks:
+        return "", poem_text_parts
+
+    _, last_text = collected_blocks[-1]
+    candidate = last_text.strip()
+
+    if config.author_attribution_pattern:
+        m = re.match(config.author_attribution_pattern, candidate)
+        if m:
+            # Use first capture group if present, else the full match
+            raw_name = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
+            return _clean_name(raw_name), poem_text_parts[:-1]
+        return "", poem_text_parts
+
+    # Fallback: standard uppercase-ratio heuristic
+    if classify_toc_entry(candidate, threshold=config.poet_uppercase_threshold) == "poet":
+        return _clean_name(candidate), poem_text_parts[:-1]
+
+    return "", poem_text_parts
+
+
+def load_anthology_config(pdf_path: Path) -> AnthologyConfig:
+    """
+    Load config for the given PDF using a two-level lookup:
+
+      1. Directory-level: config.json in the same directory as the PDF.
+         Applies to every PDF in that directory — useful for large batches
+         that share a common layout.
+      2. Per-file sidecar: a JSON file with the same stem as the PDF
+         (e.g. anthology.pdf → anthology.json).  Any keys present here
+         override the directory-level values.
+
+    If neither file exists, a default AnthologyConfig() is returned.
+    Unknown keys in either file are silently ignored.
+    """
+    valid_fields = AnthologyConfig.__dataclass_fields__
+    merged: dict = {}
+
+    dir_config_path = pdf_path.parent / "config.json"
+    if dir_config_path.exists():
+        with open(dir_config_path, encoding="utf-8") as f:
+            data = json.load(f)
+        kwargs = {k: v for k, v in data.items() if k in valid_fields}
+        merged.update(kwargs)
+        print(f"[config] Loaded directory config from {dir_config_path.name}: {kwargs}", file=sys.stderr)
+
+    per_file_path = pdf_path.with_suffix(".json")
+    if per_file_path.exists():
+        with open(per_file_path, encoding="utf-8") as f:
+            data = json.load(f)
+        kwargs = {k: v for k, v in data.items() if k in valid_fields}
+        merged.update(kwargs)
+        print(f"[config] Loaded per-file config from {per_file_path.name}: {kwargs}", file=sys.stderr)
+
+    return AnthologyConfig(**merged)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Marker runner
 # ─────────────────────────────────────────────────────────────────────────────
@@ -523,7 +905,7 @@ def run_marker(pdf_path: str, start_page: int = None, end_page: int = None):
 
     config: dict = {"output_format": "json"}
     if start_page is not None:
-        config["page_range"] = f"{start_page}-{end_page}" if end_page else f"{start_page}-"
+        config["page_range"] = f"{start_page}-{end_page}" if end_page is not None else f"{start_page}-"
 
     config_parser = ConfigParser(config)
     converter = PoetryPdfConverter(
@@ -546,7 +928,7 @@ def write_output(poems: list[Poem], output_dir: Path, stem: str, fmt: str):
     if fmt == "csv":
         path = output_dir / f"{stem}_poems.csv"
         fields = ["title", "author", "collection", "source_anthology",
-                  "source_page", "text", "notes", "needs_review", "review_reason"]
+                  "source_page", "text", "notes"]
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -616,8 +998,6 @@ def write_output(poems: list[Poem], output_dir: Path, stem: str, fmt: str):
                     "line_count": len(lines),
                     "stanza_count": len(stanzas),
                     "notes": poem.notes,
-                    "needs_review": poem.needs_review,
-                    "review_reason": poem.review_reason,
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         print(f"[output] JSONL → {path}  ({len(poems)} records)")
@@ -668,6 +1048,8 @@ def main():
 
     for pdf_path in pdfs:
         stem = pdf_path.stem
+        anthology_config = load_anthology_config(pdf_path)
+
         try:
             rendered = run_marker(str(pdf_path), args.start_page, args.end_page)
         except Exception as e:
@@ -678,7 +1060,10 @@ def main():
             toc = rendered.metadata.get("table_of_contents", [])
             print(f"\n[toc] {len(toc)} entries in {pdf_path.name}:")
             for entry in toc:
-                kind = classify_toc_entry(entry["title"]) or "SKIP"
+                kind = classify_toc_entry(
+                    entry["title"],
+                    threshold=anthology_config.poet_uppercase_threshold,
+                ) or "SKIP"
                 print(f"  {kind:<12}  p{entry['page_id']:>4}  {entry['title']!r}")
             continue
 
@@ -686,12 +1071,10 @@ def main():
             rendered,
             anthology_name=stem,
             merge_speakers=not args.no_merge_speakers,
+            config=anthology_config,
         )
 
         print(f"[extract] {len(poems)} poems from {pdf_path.name}")
-        review_count = sum(1 for p in poems if p.needs_review)
-        if review_count:
-            print(f"[review]  {review_count} poems flagged for review")
 
         write_output(poems, output_dir, stem, args.output_format)
 
