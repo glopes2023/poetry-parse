@@ -161,12 +161,24 @@ def load_author_timeline(toc_path: Path, page_offset: int = 0) -> list[tuple[int
     return markers
 
 
-def expected_author_at(page: int, timeline: list[tuple[int, list[str]]]) -> list[str]:
-    """Names from the most recent author header at or before `page` ([] if none)."""
+def expected_author_at(
+    page: int, timeline: list[tuple[int, list[str]]], slack: int = 3
+) -> list[str]:
+    """Names acceptable for a poem on `page` ([] if none).
+
+    Returns the most recent author header at or before `page`, plus the next
+    header if it begins within `slack` pages.  A poet's first poem routinely
+    prints 1–2 pages before that poet's ToC header, so near a section boundary
+    the upcoming poet is also a valid author — without this tolerance every
+    section's opening poem would be a false AUTHOR_MISMATCH.
+    """
     found: list[str] = []
     for p, names in timeline:
         if p <= page:
-            found = names
+            found = list(names)
+        elif p <= page + slack:        # upcoming header within the boundary band
+            found = found + list(names)
+            break
         else:
             break
     return found
