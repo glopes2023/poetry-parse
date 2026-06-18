@@ -11,9 +11,12 @@ Structural flags (no reference needed):
   PAGE_GAP       — source_page gap > 15 between consecutive poems
 
 Reference flags (requires --toc-file):
-  MISSING     — reference entry has no matching extracted poem
-  EXTRA       — extracted poem has no matching reference entry
-  PAGE_MISMATCH — title matched but page numbers differ by > 3
+  MISSING        — reference entry has no matching extracted poem
+  EXTRA          — extracted poem has no matching reference entry
+  PAGE_MISMATCH  — title matched but page numbers differ by > 3
+  AUTHOR_MISMATCH — author is a plausible name but disagrees with the ToC
+                    author timeline at this page (the correct name is written
+                    to the review CSV's ref_author column)
 
 Usage:
     python compare_toc.py --pdf data/Golden_Treasury.pdf
@@ -109,6 +112,84 @@ def is_suspect_author(author: str, title_set: set[str]) -> bool:
     if _ROMAN_AUTHOR_RE.match(a) or _BOOK_CANTO_RE.match(a):
         return True
     return normalize_title(a) in title_set
+
+
+# A ToC row is an author header when its parenthetical holds life-dates — a
+# year range or a "b./d./fl./born/about/?" cue.  A bare year like "(1691)" is a
+# poem date, not a poet, so it must NOT match.
+_LIFE_DATES_RE = re.compile(
+    r"\([^)]*(?:\d{3,4}\s*[-–—]\s*\d{0,4}|\bb\.|\bd\.|\bfl\.|born|about|\?)[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+def _header_names(title: str) -> list[str]:
+    """Split an author-header title into individual poet names.
+
+    Drops the life-date parentheticals, then splits a combined header on the
+    comma between poets:
+      "John Wesley (1703-1791), Charles Wesley (1708-1788)" → ["John Wesley", "Charles Wesley"]
+      "Joseph Addison (1672-1719)"                          → ["Joseph Addison"]
+    """
+    cleaned = re.sub(r"\s*\([^)]*\)", "", title)
+    return [p.strip(" :.,;") for p in cleaned.split(",") if p.strip(" :.,;")]
+
+
+def load_author_timeline(toc_path: Path, page_offset: int = 0) -> list[tuple[int, list[str]]]:
+    """Build a page→author(s) timeline from the ToC's author-header rows.
+
+    Pages are shifted by page_offset so the timeline is on the parser's
+    source_page scale.  Returns (page, [names]) tuples sorted by page.
+    """
+    markers: list[tuple[int, list[str]]] = []
+    with open(toc_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames:
+            reader.fieldnames = [h.lower() for h in reader.fieldnames]
+        for row in reader:
+            title = (row.get("title") or "").strip()
+            if not title or not _LIFE_DATES_RE.search(title):
+                continue
+            try:
+                page = int(row.get("page", 0)) + page_offset
+            except (ValueError, TypeError):
+                continue
+            names = _header_names(title)
+            if names:
+                markers.append((page, names))
+    markers.sort(key=lambda m: m[0])
+    return markers
+
+
+def expected_author_at(page: int, timeline: list[tuple[int, list[str]]]) -> list[str]:
+    """Names from the most recent author header at or before `page` ([] if none)."""
+    found: list[str] = []
+    for p, names in timeline:
+        if p <= page:
+            found = names
+        else:
+            break
+    return found
+
+
+def author_agrees(parser_author: str, expected: list[str]) -> bool:
+    """True when the parser's author is consistent with any expected ToC name.
+
+    Tolerant of OCR noise and first-name variation: accepts an exact match, a
+    high character-similarity (≥0.7), or a shared surname (last token).
+    """
+    pa = normalize_title(parser_author)
+    if not pa:
+        return True  # empty is NO_AUTHOR, judged elsewhere
+    for name in expected:
+        en = normalize_title(name)
+        if not en:
+            continue
+        if pa == en or SequenceMatcher(None, pa, en).ratio() >= 0.7:
+            return True
+        if pa.split()[-1] == en.split()[-1]:
+            return True
+    return False
 
 
 def compute_structural_flags(poems: list[dict]) -> list[list[str]]:
@@ -398,6 +479,7 @@ def main() -> None:
     ref_entries: list[dict] | None = None
     ref_match: list[int | None] | None = None
     poem_match: list[int | None] | None = None
+    expected_authors: list[str] = [""] * len(poems)
 
     if args.toc_file:
         toc_path = Path(args.toc_file)
@@ -416,6 +498,20 @@ def main() -> None:
                 parser_page = poems[j].get("source_page", 0)
                 if abs(parser_page - ref_page) > 3:
                     all_flags[j].append("PAGE_MISMATCH")
+
+        # Tier 2: cross-check each author against a page→author timeline built
+        # from the ToC's author headers.  Catches plausible-but-wrong names
+        # (carried forward across a section boundary) that Tier 1 can't see.
+        author_timeline = load_author_timeline(toc_path, page_offset=args.page_offset)
+        for j, poem in enumerate(poems):
+            expected = expected_author_at(poem.get("source_page", 0), author_timeline)
+            expected_authors[j] = ", ".join(expected)
+            parser_author = poem.get("author", "").strip()
+            # Only flag plausible names here; obvious junk is already AUTHOR_SUSPECT.
+            if (parser_author and expected
+                    and "AUTHOR_SUSPECT" not in all_flags[j]
+                    and not author_agrees(parser_author, expected)):
+                all_flags[j].append("AUTHOR_MISMATCH")
 
     # ── Terminal summary ──────────────────────────────────────────────────────
 
@@ -471,6 +567,7 @@ def main() -> None:
             "parser_title": poem.get("title", ""),
             "parser_page": poem.get("source_page", ""),
             "author": poem.get("author", ""),
+            "ref_author": expected_authors[j],
             "author_source": poem.get("author_source", ""),
             "text_length": len(text),
             "flags": "|".join(all_flags[j]),
@@ -488,6 +585,7 @@ def main() -> None:
                     "parser_title": "",
                     "parser_page": "",
                     "author": ref.get("author", ""),
+                    "ref_author": "",
                     "author_source": "",
                     "text_length": "",
                     "flags": "MISSING",
@@ -499,7 +597,8 @@ def main() -> None:
 
     fields = [
         "idx", "ref_title", "ref_page", "parser_title", "parser_page",
-        "author", "author_source", "text_length", "flags", "text_preview", "manual_author",
+        "author", "ref_author", "author_source", "text_length", "flags",
+        "text_preview", "manual_author",
     ]
     csv_path = output_dir / f"{stem}_toc_review.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
