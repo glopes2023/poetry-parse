@@ -40,21 +40,40 @@ def normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _split_ref_title(title: str) -> tuple[str, str]:
+    """Split 'Main Title (parenthetical)' into (main, paren_content).
+
+    Returns (title, '') when no parenthetical is present.
+    The parenthetical often uniquely identifies a generic title like 'Song'
+    when the parser captures the full context (e.g. 'Song from The Fortunate Isles').
+    """
+    m = re.search(r"\s*\(([^)]+)\)\s*$", title)
+    if m:
+        return title[:m.start()].strip(), m.group(1).strip()
+    return title, ""
+
+
 def load_poems(poems_path: Path) -> list[dict]:
     with open(poems_path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_toc_file(toc_path: Path) -> list[dict]:
+def load_toc_file(toc_path: Path, page_offset: int = 0) -> list[dict]:
     entries = []
     with open(toc_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        # Normalise header keys to lowercase so Title/Page and title/page both work
+        if reader.fieldnames:
+            reader.fieldnames = [h.lower() for h in reader.fieldnames]
         for row in reader:
             title = row.get("title", "").strip()
             if not title:
                 continue
+            # Skip author section headers (e.g. "Ben Jonson (1573-1637)")
+            if re.search(r"\(\s*\d{4}", title):
+                continue
             try:
-                page = int(row.get("page", 0))
+                page = int(row.get("page", 0)) + page_offset
             except (ValueError, TypeError):
                 page = 0
             entries.append({
@@ -131,6 +150,31 @@ def align_with_reference(
     poem_pages = [p.get("source_page", 0) for p in poems]
     ref_pages = [r.get("page", 0) for r in ref_entries]
 
+    # Precompute split forms for reference titles so that parenthetical content
+    # (e.g. "Song (from The Fortunate Isles)" → paren: "from The Fortunate Isles")
+    # can serve as an alternate identifier when the main title is too generic.
+    ref_raw_splits = [_split_ref_title(r["title"]) for r in ref_entries]
+    norm_ref_mains  = [normalize_title(main) for main, _ in ref_raw_splits]
+    norm_ref_parens = [normalize_title(paren) for _, paren in ref_raw_splits]
+
+    def _best_sim(i: int, npoe: str) -> float:
+        """Max SequenceMatcher score across full, main, and paren forms."""
+        scores = [SequenceMatcher(None, norm_refs[i], npoe).ratio()]
+        if norm_ref_mains[i] and norm_ref_mains[i] != norm_refs[i]:
+            scores.append(SequenceMatcher(None, norm_ref_mains[i], npoe).ratio())
+        if norm_ref_parens[i]:
+            scores.append(SequenceMatcher(None, norm_ref_parens[i], npoe).ratio())
+        return max(scores)
+
+    def _best_overlap(i: int, npoe: str) -> float:
+        """Max word-overlap score across full, main, and paren forms."""
+        candidates = [norm_refs[i]]
+        if norm_ref_mains[i] and norm_ref_mains[i] != norm_refs[i]:
+            candidates.append(norm_ref_mains[i])
+        if norm_ref_parens[i] and len(norm_ref_parens[i].split()) >= 2:
+            candidates.append(norm_ref_parens[i])
+        return max(_word_overlap(c, npoe) for c in candidates)
+
     matched_poem_idxs: set[int] = set()
     matched_ref_idxs: set[int] = set()
     ref_match: list[int | None] = [None] * len(ref_entries)
@@ -142,17 +186,17 @@ def align_with_reference(
         matched_poem_idxs.add(j)
         matched_ref_idxs.add(i)
 
-    # Pass 1: exact normalized matches
+    # Pass 1: exact normalized match (full title or main part alone)
     for i, nref in enumerate(norm_refs):
         for j, npoe in enumerate(norm_poems):
             if j in matched_poem_idxs:
                 continue
-            if nref == npoe:
+            if nref == npoe or norm_ref_mains[i] == npoe:
                 _commit(i, j)
                 break
 
-    # Pass 2: character-level fuzzy (SequenceMatcher ≥ 0.80)
-    for i, nref in enumerate(norm_refs):
+    # Pass 2: character-level fuzzy across full/main/paren (SequenceMatcher ≥ 0.80)
+    for i in range(len(ref_entries)):
         if i in matched_ref_idxs:
             continue
         best_score = 0.0
@@ -160,7 +204,7 @@ def align_with_reference(
         for j, npoe in enumerate(norm_poems):
             if j in matched_poem_idxs:
                 continue
-            score = SequenceMatcher(None, nref, npoe).ratio()
+            score = _best_sim(i, npoe)
             if score > best_score:
                 best_score = score
                 best_j = j
@@ -168,12 +212,11 @@ def align_with_reference(
             _commit(i, best_j)
 
     # Pass 3: word-token overlap + page proximity for OCR-noisy titles.
-    # Requires ≥ 2 words in the shorter title to avoid spurious single-word matches.
-    for i, nref in enumerate(norm_refs):
+    # Tests full, main, and paren forms; requires ≥ 2 words in candidate.
+    for i in range(len(ref_entries)):
         if i in matched_ref_idxs:
             continue
-        ref_words = nref.split()
-        if len(ref_words) < 2:
+        if len(norm_refs[i].split()) < 2 and len(norm_ref_parens[i].split()) < 2:
             continue
         best_score = 0.0
         best_j: int | None = None
@@ -182,7 +225,7 @@ def align_with_reference(
                 continue
             if abs(ref_pages[i] - poem_pages[j]) > 5:
                 continue
-            overlap = _word_overlap(nref, npoe)
+            overlap = _best_overlap(i, npoe)
             if overlap > best_score:
                 best_score = overlap
                 best_j = j
@@ -297,6 +340,10 @@ def main() -> None:
     parser.add_argument("--pdf", required=True, help="Path to the anthology PDF")
     parser.add_argument("--toc-file", help="Reference ToC CSV (title, page [, author])")
     parser.add_argument(
+        "--page-offset", type=int, default=0,
+        help="Added to every page number in the ToC CSV (e.g. 19 if pages are book-relative)",
+    )
+    parser.add_argument(
         "--output-dir", default="pipeline_output/marker_poems",
         help="Where to find _poems.json and write review CSV (default: pipeline_output/marker_poems)"
     )
@@ -326,7 +373,7 @@ def main() -> None:
         if not toc_path.exists():
             print(f"[error] ToC file not found: {toc_path}", file=sys.stderr)
             sys.exit(1)
-        ref_entries = load_toc_file(toc_path)
+        ref_entries = load_toc_file(toc_path, page_offset=args.page_offset)
         ref_match, poem_match = align_with_reference(poems, ref_entries)
 
         for j in range(len(poems)):
