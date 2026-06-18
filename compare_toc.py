@@ -3,10 +3,12 @@
 compare_toc.py — Compare parser output against a reference ToC and flag issues.
 
 Structural flags (no reference needed):
-  NO_AUTHOR   — author field empty
-  SWALLOWED   — text length > Q3 + 3×IQR, or text contains embedded headings (##)
-  SHORT_TEXT  — text < 80 chars
-  PAGE_GAP    — source_page gap > 15 between consecutive poems
+  NO_AUTHOR      — author field empty
+  AUTHOR_SUSPECT — author looks like a title/section header, not a person
+                   (roman numeral, "Book/Canto N", or matches a poem title)
+  SWALLOWED      — text length > Q3 + 3×IQR, or text contains embedded headings (##)
+  SHORT_TEXT     — text < 80 chars
+  PAGE_GAP       — source_page gap > 15 between consecutive poems
 
 Reference flags (requires --toc-file):
   MISSING     — reference entry has no matching extracted poem
@@ -84,8 +86,35 @@ def load_toc_file(toc_path: Path, page_offset: int = 0) -> list[dict]:
     return entries
 
 
+# Author strings that are really titles / section labels, not people.
+_ROMAN_AUTHOR_RE = re.compile(r"^[ivxlcdm]+\.?$", re.IGNORECASE)
+_BOOK_CANTO_RE = re.compile(r"^(book|canto|part|chapter|stanza|act|scene)\b", re.IGNORECASE)
+
+
+def is_suspect_author(author: str, title_set: set[str]) -> bool:
+    """True when an author string looks like a title/section header, not a person.
+
+    Tier-1 structural checks (no reference needed):
+      - bare roman numeral            → "Iii", "Xiii", "Ix"
+      - "Book/Canto/Part N" heading   → "Book Iv", "Canto Iii"
+      - matches the title of some poem in the same file → carried-forward
+        title-as-author, e.g. "Snow", "Minstrels' Marriage-Song"
+
+    A real poet's name almost never collides with a poem title; a title that
+    got mis-classified as an author and carried forward always does.
+    """
+    a = author.strip()
+    if not a:
+        return False  # empty is NO_AUTHOR, handled separately
+    if _ROMAN_AUTHOR_RE.match(a) or _BOOK_CANTO_RE.match(a):
+        return True
+    return normalize_title(a) in title_set
+
+
 def compute_structural_flags(poems: list[dict]) -> list[list[str]]:
     lengths = [len(p.get("text", "")) for p in poems]
+    title_set = {normalize_title(p.get("title", "")) for p in poems}
+    title_set.discard("")
 
     if len(lengths) >= 4:
         q1, _, q3 = statistics.quantiles(lengths, n=4)
@@ -104,6 +133,8 @@ def compute_structural_flags(poems: list[dict]) -> list[list[str]]:
 
         if not author:
             flags.append("NO_AUTHOR")
+        elif is_suspect_author(author, title_set):
+            flags.append("AUTHOR_SUSPECT")
         if text_len < 80:
             flags.append("SHORT_TEXT")
         if text_len > swallowed_threshold or re.search(r"^#{2,}", text, re.MULTILINE):
