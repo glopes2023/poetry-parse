@@ -620,6 +620,50 @@ def main() -> None:
 
     print(f"\n[compare] Review CSV → {csv_path}")
 
+    # ── Flagged-entries CSV ────────────────────────────────────────────────────
+    # Mirrors the terminal summary: the per-flag counts, every flagged poem, any
+    # MISSING reference entries, and the fidelity scores — written alongside the
+    # review CSV as flagged_entries.csv.
+
+    flagged_path = output_dir / f"{stem}_flagged_entries.csv"
+    with open(flagged_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        writer.writerow(["section", "page", "title", "author", "flags"])
+
+        for code, count in sorted(flag_counts.items()):
+            writer.writerow(["flag_count", "", code, "", count])
+
+        for poem, flags in flagged:
+            writer.writerow([
+                "flagged",
+                poem.get("source_page", 0),
+                poem.get("title", "") or "",
+                poem.get("author", "") or "",
+                ", ".join(flags),
+            ])
+
+        if ref_entries is not None and ref_match is not None:
+            for i, m in enumerate(ref_match):
+                if m is None:
+                    ref = ref_entries[i]
+                    writer.writerow([
+                        "missing",
+                        ref["page"],
+                        ref["title"],
+                        ref.get("author", ""),
+                        "MISSING",
+                    ])
+
+        for key in (
+            "recall", "precision", "f1",
+            "boundary_score", "completeness_score", "author_score", "fidelity",
+        ):
+            if key in scores:
+                writer.writerow(["fidelity", "", key, "", f"{scores[key]:.4f}"])
+
+    print(f"[compare] Flagged entries CSV → {flagged_path}")
+
 
 if __name__ == "__main__":
     main()
