@@ -185,6 +185,11 @@ python parse_marker.py --input data/anthology.pdf --dump_toc
 
 ## Corpus post-processing
 
+> ⚠️ **Experimental — not fully fleshed out or tested.** The corpus pipeline is
+> a work in progress and hasn't been validated end-to-end. For now, prefer the
+> primary workflow above (parse with `parse_marker.py`, evaluate with
+> `compare_toc.py`). Treat anything below as exploratory.
+
 After extraction, run the corpus pipeline to validate records, quarantine likely
 structural problems, and produce OCR-noise candidates:
 
