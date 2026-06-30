@@ -183,56 +183,6 @@ python parse_marker.py --input data/ --output_format csv
 python parse_marker.py --input data/anthology.pdf --dump_toc
 ```
 
-## Corpus post-processing
-
-> ⚠️ **Experimental — not fully fleshed out or tested.** The corpus pipeline is
-> a work in progress and hasn't been validated end-to-end. For now, prefer the
-> primary workflow above (parse with `parse_marker.py`, evaluate with
-> `compare_toc.py`). Treat anything below as exploratory.
-
-After extraction, run the corpus pipeline to validate records, quarantine likely
-structural problems, and produce OCR-noise candidates:
-
-```bash
-python corpus_pipeline.py --input pipeline_output/marker_poems
-```
-
-This writes to `pipeline_output/corpus/` by default:
-
-| File | Description |
-|---|---|
-| `clean_poems.jsonl` | Records without error-level QA flags |
-| `review_poems.jsonl` | Records needing review, such as empty text or swallowed boundaries |
-| `review_poems.csv` | Compact review sheet with IDs, flags, metrics, and text previews |
-| `final_poems.jsonl` | Analysis-ready records after automatic QA and optional review decisions |
-| `ocr_candidates.csv` | Suspicious OCR tokens with example context |
-| `corpus_report.json` | Summary counts by anthology, flag type, and severity |
-
-The pipeline preserves parser fields and adds `id`, `text_raw`, `text_clean`,
-`qa_flags`, `qa_flag_codes`, `source_record_index`, and `source_record_path`.
-It treats JSON and JSONL outputs with the same anthology stem as alternate
-serializations and loads only one, avoiding false duplicate reports.
-
-To create a review-decision template:
-
-```bash
-python corpus_pipeline.py --input pipeline_output/marker_poems --write_decisions_template
-```
-
-This creates `pipeline_output/corpus/corpus_decisions.template.json` with the
-current review IDs. Copy or rename it, then fill `keep_ids`, `drop_ids`, and
-optional `notes`. Re-run with:
-
-```bash
-python corpus_pipeline.py \
-  --input pipeline_output/marker_poems \
-  --decisions pipeline_output/corpus/corpus_decisions.json
-```
-
-Without a decisions file, `final_poems.jsonl` contains only automatically clean
-records. Review records move into `final_poems.jsonl` only when their IDs are
-listed in `keep_ids`.
-
 ## Output formats
 
 | Format | Description |
@@ -329,3 +279,53 @@ Mixed-case author names with biography sections to skip:
   "skip_bio_pattern": "^(Note on|Notes on|Editor.s Note)"
 }
 ```
+
+## Corpus post-processing
+
+> ⚠️ **Experimental — not fully fleshed out or tested.** The corpus pipeline is
+> a work in progress and hasn't been validated end-to-end. For now, prefer the
+> primary workflow above (parse with `parse_marker.py`, evaluate with
+> `compare_toc.py`). Treat anything below as exploratory.
+
+After extraction, run the corpus pipeline to validate records, quarantine likely
+structural problems, and produce OCR-noise candidates:
+
+```bash
+python corpus_pipeline.py --input pipeline_output/marker_poems
+```
+
+This writes to `pipeline_output/corpus/` by default:
+
+| File | Description |
+|---|---|
+| `clean_poems.jsonl` | Records without error-level QA flags |
+| `review_poems.jsonl` | Records needing review, such as empty text or swallowed boundaries |
+| `review_poems.csv` | Compact review sheet with IDs, flags, metrics, and text previews |
+| `final_poems.jsonl` | Analysis-ready records after automatic QA and optional review decisions |
+| `ocr_candidates.csv` | Suspicious OCR tokens with example context |
+| `corpus_report.json` | Summary counts by anthology, flag type, and severity |
+
+The pipeline preserves parser fields and adds `id`, `text_raw`, `text_clean`,
+`qa_flags`, `qa_flag_codes`, `source_record_index`, and `source_record_path`.
+It treats JSON and JSONL outputs with the same anthology stem as alternate
+serializations and loads only one, avoiding false duplicate reports.
+
+To create a review-decision template:
+
+```bash
+python corpus_pipeline.py --input pipeline_output/marker_poems --write_decisions_template
+```
+
+This creates `pipeline_output/corpus/corpus_decisions.template.json` with the
+current review IDs. Copy or rename it, then fill `keep_ids`, `drop_ids`, and
+optional `notes`. Re-run with:
+
+```bash
+python corpus_pipeline.py \
+  --input pipeline_output/marker_poems \
+  --decisions pipeline_output/corpus/corpus_decisions.json
+```
+
+Without a decisions file, `final_poems.jsonl` contains only automatically clean
+records. Review records move into `final_poems.jsonl` only when their IDs are
+listed in `keep_ids`.
